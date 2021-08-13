@@ -984,7 +984,6 @@ class Trainer:
                 output_device=self.args.local_rank,
                 find_unused_parameters=find_unused_parameters,
             )
-
         return model
 
     def train(
@@ -1258,8 +1257,12 @@ class Trainer:
             )
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
-            for step, inputs in enumerate(epoch_iterator):
+            all_start = time.time()
 
+            # logger.info(f"model param data type = {}")
+
+            for step, inputs in enumerate(epoch_iterator):
+                start_batch = time.time()
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -1287,6 +1290,7 @@ class Trainer:
                     tr_loss += self.training_step(model, inputs)
                 self.current_flos += float(self.floating_point_ops(inputs))
 
+                step_start = time.time()
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
                 if self.deepspeed:
                     self.deepspeed.step()
@@ -1346,6 +1350,20 @@ class Trainer:
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+
+                torch.cuda.synchronize()
+                step_end = time.time()
+                elapsed_time = (step_end-step_start) * 1000.0
+                logger.info("{}: {:.2f}".format("step time = ", elapsed_time))
+
+                batch_end = time.time()
+                elapsed_time = (batch_end - start_batch) * 1000.0
+                logger.info("{}: {:.2f}".format("batch time = ", elapsed_time))
+
+            all_end = time.time()
+            elapsed_time = (all_end - all_start) * 1000.0
+            logger.info("{}: {:.2f}".format("all time = ", elapsed_time))
+
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
             self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
@@ -1770,10 +1788,17 @@ class Trainer:
         model.train()
         inputs = self._prepare_inputs(inputs)
 
+        if not hasattr(self, 'count'):
+            self.count = 0
+
         if is_sagemaker_mp_enabled():
             scaler = self.scaler if self.use_amp else None
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
             return loss_mb.reduce_mean().detach().to(self.args.device)
+
+
+        torch.cuda.synchronize()
+        start_time = time.time()
 
         if self.use_amp:
             with autocast():
@@ -1788,6 +1813,16 @@ class Trainer:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
 
+        # torch.cuda.synchronize()
+        torch.distributed.barrier()
+        end_time = time.time()
+
+        elapsed_time = (end_time-start_time) * 1000.0
+        logger.info("{}: {:.2f}".format("compute loss time = ", elapsed_time))
+
+        torch.distributed.barrier()
+        start_time = time.time()
+
         if self.use_amp:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -1799,6 +1834,14 @@ class Trainer:
         else:
             loss.backward()
 
+        # torch.cuda.synchronize()
+        torch.distributed.barrier()
+        end_time = time.time()
+
+        elapsed_time = (end_time-start_time) * 1000.0
+        logger.info("{}: {:.2f}".format("backward time = ", elapsed_time))
+
+        self.count += 1
         return loss.detach()
 
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -1811,7 +1854,27 @@ class Trainer:
             labels = inputs.pop("labels")
         else:
             labels = None
-        outputs = model(**inputs)
+
+        # logger.info(f"model input type = {inputs}")
+        # torch.backends.cuda.matmul.allow_tf32 = False
+        # torch.backends.cudnn.allow_tf32 = False
+        # with torch.no_grad():
+        for i in range(1):
+            torch.distributed.barrier()
+            start_time = time.time()
+
+            if i > 5:
+
+                outputs = model.module(**inputs)
+            else:
+                outputs = model(**inputs)
+
+            torch.distributed.barrier()
+            end_time = time.time()
+            elapsed_time = (end_time-start_time) * 1000.0
+            # logger.info("{}: {:.2f}".format("count = , compute loss time = ", elapsed_time))
+            logger.info(f"count = {i}, model fwd = {elapsed_time}")
+
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:

@@ -1858,22 +1858,22 @@ class Trainer:
         # logger.info(f"model input type = {inputs}")
         # torch.backends.cuda.matmul.allow_tf32 = False
         # torch.backends.cudnn.allow_tf32 = False
-        # with torch.no_grad():
-        for i in range(1):
-            torch.distributed.barrier()
-            start_time = time.time()
+        with torch.no_grad():
+            for i in range(10):
+                torch.distributed.barrier()
+                start_time = time.time()
 
-            if i > 5:
+                if i > 5:
 
-                outputs = model.module(**inputs)
-            else:
-                outputs = model(**inputs)
+                    outputs = model.module(**inputs)
+                else:
+                    outputs = model(**inputs)
 
-            torch.distributed.barrier()
-            end_time = time.time()
-            elapsed_time = (end_time-start_time) * 1000.0
-            # logger.info("{}: {:.2f}".format("count = , compute loss time = ", elapsed_time))
-            logger.info(f"count = {i}, model fwd = {elapsed_time}")
+                torch.distributed.barrier()
+                end_time = time.time()
+                elapsed_time = (end_time-start_time) * 1000.0
+                # logger.info("{}: {:.2f}".format("count = , compute loss time = ", elapsed_time))
+                logger.info(f"count = {i}, model fwd = {elapsed_time}")
 
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.

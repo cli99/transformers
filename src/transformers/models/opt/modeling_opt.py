@@ -37,6 +37,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_opt import OPTConfig
+from deepspeed.runtime.utils import see_memory_usage
 
 
 logger = logging.get_logger(__name__)
@@ -63,6 +64,7 @@ OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all OPT models at https://huggingface.co/models?filter=opt
 ]
 
+see_mem = True
 
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
@@ -155,17 +157,26 @@ class OPTAttention(nn.Module):
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        kv_offload: Optional[bool]  = None,
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
+        kv_offload = kv_offload if kv_offload else self.config.kv_offload
 
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, _ = hidden_states.size()
+
+        see_memory_usage('OPTAttention before moving past_key_value to gpu', force=see_mem)
+        if kv_offload and past_key_value:
+            past_key_value_0 = past_key_value[0].to(hidden_states.device)
+            past_key_value_1 = past_key_value[1].to(hidden_states.device)
+            past_key_value = [past_key_value_0, past_key_value_1]
+        see_memory_usage('OPTAttention after moving past_key_value to gpu', force=see_mem)
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
@@ -197,7 +208,16 @@ class OPTAttention(nn.Module):
             # all previous decoder key/value_states. Further calls to uni-directional self-attention
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_states, value_states)
+            if kv_offload and past_key_value:
+                see_memory_usage('OPTAttention before moving past_key_value back to cpu', force=see_mem)
+                past_key_value = (key_states.to('cpu'), value_states.to('cpu'))
+                del past_key_value_0
+                del past_key_value_1
+                torch.cuda.empty_cache()
+                see_memory_usage('OPTAttention after moving past_key_value back to cpu', force=see_mem)
+            else:
+                past_key_value = (key_states, value_states)
+
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
@@ -223,10 +243,10 @@ class OPTAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if attn_weights.dtype == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # if attn_weights.dtype == torch.float16:
+        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+        # else:
+        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -298,6 +318,7 @@ class OPTDecoderLayer(nn.Module):
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        kv_offload: Optional[bool] = False,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -315,6 +336,7 @@ class OPTDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
+        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
 
         residual = hidden_states
 
@@ -326,6 +348,7 @@ class OPTDecoderLayer(nn.Module):
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             past_key_value=past_key_value,
+            kv_offload=kv_offload,
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
@@ -555,6 +578,7 @@ class OPTDecoder(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        kv_offload: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -606,6 +630,9 @@ class OPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
+        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
+        print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -624,6 +651,8 @@ class OPTDecoder(OPTPreTrainedModel):
             input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+
+        # print(f'in decoder forward before loop, len(past_key_values) = {len(past_key_values) if past_key_values else None}, past_key_values[0].shape: {past_key_values[0][0].shape if past_key_values else None}, device = {past_key_values[0][0].device if past_key_values else None} ')
 
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
@@ -666,6 +695,8 @@ class OPTDecoder(OPTPreTrainedModel):
                     )
 
         for idx, decoder_layer in enumerate(self.layers):
+            see_memory_usage(f'before decoder layer {idx}', force=True)
+
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -698,6 +729,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     attention_mask=attention_mask,
                     layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                     past_key_value=past_key_value,
+                    kv_offload=kv_offload,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
@@ -710,6 +742,8 @@ class OPTDecoder(OPTPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+            see_memory_usage(f'after decoder layer {idx}', force=True)
+
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
 
@@ -721,6 +755,8 @@ class OPTDecoder(OPTPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        print(f'next_cache[0][0].shape: {next_cache[0][0].shape if next_cache else None}, device = {next_cache[0][0].device if next_cache else None}')
+
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -766,10 +802,14 @@ class OPTModel(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        kv_offload: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
+        print(f'{self.__class__}fwd, kv_offload = {kv_offload}')
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -785,6 +825,7 @@ class OPTModel(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            kv_offload=kv_offload,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -842,6 +883,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        kv_offload: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -919,6 +961,8 @@ class OPTForCausalLM(OPTPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
         ```"""
+        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
+        print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -926,6 +970,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        see_memory_usage('before model.decoder', force=True)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.decoder(
             input_ids=input_ids,
@@ -934,10 +979,12 @@ class OPTForCausalLM(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            kv_offload=kv_offload,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        see_memory_usage('after model.decoder', force=True)
 
         logits = self.lm_head(outputs[0]).contiguous()
 

@@ -113,6 +113,7 @@ class OPTConfig(PretrainedConfig):
         layerdrop=0.0,
         init_std=0.02,
         use_cache=True,
+        kv_offload=False,
         pad_token_id=1,
         bos_token_id=2,
         eos_token_id=2,
@@ -139,6 +140,7 @@ class OPTConfig(PretrainedConfig):
         self.init_std = init_std
         self.layerdrop = layerdrop
         self.use_cache = use_cache
+        self.kv_offload = kv_offload
         self.do_layer_norm_before = do_layer_norm_before
         # We keep these variables at `True` for backward compatibility.
         self.enable_bias = enable_bias

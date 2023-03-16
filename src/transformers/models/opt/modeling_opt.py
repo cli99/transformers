@@ -39,6 +39,33 @@ from ...utils import (
 from .configuration_opt import OPTConfig
 from deepspeed.runtime.utils import see_memory_usage
 
+import time
+from typing import (Any, Callable, DefaultDict, Dict, Iterable, Iterator, List,
+                    Optional, Sequence, Set, Tuple, TypeVar, Union, cast)
+
+class TimedSync:
+    """a context-manager object that prints timing observations. This object is torchscriptable"""
+
+    def __init__(self, f):
+        self.f = f
+        self.cuda_start = torch.cuda.Event(enable_timing=True)
+        self.cuda_end = torch.cuda.Event(enable_timing=True)
+
+    def __enter__(self):
+        self.start = time.time()
+        self.cuda_start.record()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any):
+        self.end = time.time()
+        self.cuda_end.record()
+        self.cuda_end.synchronize()
+        self.cuda_time = self.cuda_start.elapsed_time(self.cuda_end)
+        self.cpu_time = self.end - self.start
+        print(
+            f"{self.f} took {self.cpu_time * 1000:.3f}ms on CPU, {self.cuda_time:.3f}ms on GPU"
+        )
+
 
 logger = logging.get_logger(__name__)
 
@@ -157,26 +184,22 @@ class OPTAttention(nn.Module):
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        kv_offload: Optional[bool]  = None,
+        kv_offload: Optional[bool] = None,
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
         kv_offload = kv_offload if kv_offload else self.config.kv_offload
+        is_decoding_stage = past_key_value is not None
+        if see_mem:
+            print(f'in {self.__class__}, is_decoding_stage =  {is_decoding_stage}')
 
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, _ = hidden_states.size()
-
-        see_memory_usage('OPTAttention before moving past_key_value to gpu', force=see_mem)
-        if kv_offload and past_key_value:
-            past_key_value_0 = past_key_value[0].to(hidden_states.device)
-            past_key_value_1 = past_key_value[1].to(hidden_states.device)
-            past_key_value = [past_key_value_0, past_key_value_1]
-        see_memory_usage('OPTAttention after moving past_key_value to gpu', force=see_mem)
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
@@ -193,8 +216,14 @@ class OPTAttention(nn.Module):
             # reuse k, v, self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            if kv_offload:
+                key_states_cpu = key_states.to('cpu')
+                value_states_cpu = value_states.to('cpu')
+                key_states = torch.cat([past_key_value[0], key_states_cpu], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states_cpu], dim=2)
+            else:
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
@@ -208,15 +237,9 @@ class OPTAttention(nn.Module):
             # all previous decoder key/value_states. Further calls to uni-directional self-attention
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
-            if kv_offload and past_key_value:
-                see_memory_usage('OPTAttention before moving past_key_value back to cpu', force=see_mem)
+            past_key_value = (key_states, value_states)
+            if (not is_decoding_stage) and kv_offload:
                 past_key_value = (key_states.to('cpu'), value_states.to('cpu'))
-                del past_key_value_0
-                del past_key_value_1
-                torch.cuda.empty_cache()
-                see_memory_usage('OPTAttention after moving past_key_value back to cpu', force=see_mem)
-            else:
-                past_key_value = (key_states, value_states)
 
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
@@ -224,8 +247,12 @@ class OPTAttention(nn.Module):
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
+        if is_decoding_stage and kv_offload:
+            query_states = query_states.to('cpu')
+
+        # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        attn_weights = torch.bmm(query_states.float(), key_states.transpose(1, 2).float())
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -238,6 +265,8 @@ class OPTAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
+            if is_decoding_stage and kv_offload:
+                attention_mask = attention_mask.to('cpu')
             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
@@ -269,7 +298,11 @@ class OPTAttention(nn.Module):
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        attn_output = torch.bmm(attn_probs, value_states)
+        attn_output = torch.bmm(attn_probs, value_states.float()).to(hidden_states.dtype)
+
+        # EVERYTHING ABOVE HAPPENS ON CPU when kv_offload is True in decoding stage
+        if kv_offload:
+            attn_output = attn_output.to(hidden_states.device)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -695,7 +728,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     )
 
         for idx, decoder_layer in enumerate(self.layers):
-            see_memory_usage(f'before decoder layer {idx}', force=True)
+            see_memory_usage(f'before decoder layer {idx}', force=see_mem)
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
@@ -742,7 +775,7 @@ class OPTDecoder(OPTPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-            see_memory_usage(f'after decoder layer {idx}', force=True)
+            see_memory_usage(f'after decoder layer {idx}', force=see_mem)
 
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
@@ -970,7 +1003,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        see_memory_usage('before model.decoder', force=True)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.decoder(
             input_ids=input_ids,
@@ -984,7 +1016,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        see_memory_usage('after model.decoder', force=True)
 
         logits = self.lm_head(outputs[0]).contiguous()
 

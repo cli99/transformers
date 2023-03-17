@@ -91,7 +91,7 @@ OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all OPT models at https://huggingface.co/models?filter=opt
 ]
 
-see_mem = True
+see_mem = False
 
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
@@ -188,23 +188,21 @@ class OPTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        is_decoding_stage: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Union[Tuple[torch.Tensor], torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
-        kv_offload = kv_offload if kv_offload else self.config.kv_offload
-        is_decoding_stage = past_key_value is not None
-        if see_mem:
-            print(f'in {self.__class__}, is_decoding_stage =  {is_decoding_stage}')
-
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
 
-        bsz, tgt_len, _ = hidden_states.size()
+        bsz, tgt_len, hidden_dim = hidden_states.size()
+        if see_mem and is_decoding_stage:
+            print(f'in {self.__class__}, tgt_len = {tgt_len}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}')
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
-        if is_cross_attention and past_key_value is not None:
+        if is_cross_attention and is_decoding_stage:
             # reuse k,v, cross_attentions
             key_states = past_key_value[0]
             value_states = past_key_value[1]
@@ -212,15 +210,19 @@ class OPTAttention(nn.Module):
             # cross_attentions
             key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
-        elif past_key_value is not None:
+        elif is_decoding_stage:
             # reuse k, v, self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             if kv_offload:
-                key_states_cpu = key_states.to('cpu')
-                value_states_cpu = value_states.to('cpu')
-                key_states = torch.cat([past_key_value[0], key_states_cpu], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states_cpu], dim=2)
+                seq_len = past_key_value.shape[3]
+                dst_indices = (slice(0, bsz), slice(seq_len-tgt_len, seq_len), slice(0, hidden_dim))
+                src_indices = (slice(0, bsz), slice(0, tgt_len), slice(0, hidden_dim))
+                past_key_value[0][dst_indices].copy_(key_states[src_indices])
+                past_key_value[1][dst_indices].copy_(value_states[src_indices])
+                # new_indices = (slice(0, bsz), slice(0, seq_len+tgt_len), slice(0, hidden_dim))
+                key_states, value_states = past_key_value[0], past_key_value[1]
+                # print(f'decode stage, past_key_value.shape = {past_key_value.shape}, seq_len = {seq_len}, tgt_len = {tgt_len}, key_states.shape = {key_states.shape}, key_states.device = {key_states.device}')
             else:
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
@@ -228,6 +230,7 @@ class OPTAttention(nn.Module):
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            # print(f'prompt stage, past_key_value.shape = {past_key_value.shape}, key_states.shape = {key_states.shape}, key_states.device = {key_states.device}')
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -237,10 +240,14 @@ class OPTAttention(nn.Module):
             # all previous decoder key/value_states. Further calls to uni-directional self-attention
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_states, value_states)
             if (not is_decoding_stage) and kv_offload:
-                past_key_value = (key_states.to('cpu'), value_states.to('cpu'))
-
+                b, s, h, hh  = key_states.shape
+                dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                past_key_value[0][dst_indices].copy_(key_states)
+                past_key_value[1][dst_indices].copy_(value_states)
+                past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+            else:
+                past_key_value = (key_states, value_states)
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
@@ -271,6 +278,7 @@ class OPTAttention(nn.Module):
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
+        #TODO: CHECK
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         # if attn_weights.dtype == torch.float16:
         #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -353,7 +361,8 @@ class OPTDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         kv_offload: Optional[bool] = False,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        is_decoding_stage: Optional[bool] = False,
+    ) -> Tuple[torch.FloatTensor, Optional[Union[Tuple[torch.FloatTensor,torch.FloatTensor], torch.Tensor]]]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -369,8 +378,6 @@ class OPTDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
-
         residual = hidden_states
 
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
@@ -385,6 +392,7 @@ class OPTDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            is_decoding_stage=is_decoding_stage,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -576,6 +584,11 @@ class OPTDecoder(OPTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.past_key_values_pin_mem = None
+        self.max_new_tokens = 32
+        self.num_heads = config.num_attention_heads
+        self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -663,8 +676,13 @@ class OPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
-        print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
+        if not kv_offload:
+            if hasattr(self.config, 'kv_offload'):
+                kv_offload = self.config.kv_offload
+        is_decoding_stage = past_key_values is not None
+        if see_mem:
+            print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
+            print(f'is_decoding_stage = {is_decoding_stage}')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -684,8 +702,6 @@ class OPTDecoder(OPTPreTrainedModel):
             input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-
-        # print(f'in decoder forward before loop, len(past_key_values) = {len(past_key_values) if past_key_values else None}, past_key_values[0].shape: {past_key_values[0][0].shape if past_key_values else None}, device = {past_key_values[0][0].device if past_key_values else None} ')
 
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
@@ -717,6 +733,17 @@ class OPTDecoder(OPTPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        if kv_offload:
+            if not is_decoding_stage:
+                batch_size, prompt_len, hidden_dim = hidden_states.shape
+                max_len = prompt_len + self.max_new_tokens - 1
+                assert hasattr(self, 'max_new_tokens'), 'max_new_tokens not set when kv_offload is True'
+                pin_buffer_shape = [len(self.layers), 2, batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
+                if self.past_key_values_pin_mem is not None:
+                    del self.past_key_values_pin_mem
+                self.past_key_values_pin_mem = torch.empty(pin_buffer_shape).pin_memory()
+            else:
+                batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # check if head_mask has a correct number of layers specified if desired
         for attn_mask, mask_name in zip([head_mask], ["head_mask"]):
@@ -726,7 +753,6 @@ class OPTDecoder(OPTPreTrainedModel):
                         f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for"
                         f" {head_mask.size()[0]}."
                     )
-
         for idx, decoder_layer in enumerate(self.layers):
             see_memory_usage(f'before decoder layer {idx}', force=see_mem)
 
@@ -738,7 +764,14 @@ class OPTDecoder(OPTPreTrainedModel):
             if self.training and (dropout_probability < self.layerdrop):
                 continue
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            if kv_offload:
+                seq_len = past_key_values_length
+                bsz, tgt_len, hidden_dim = hidden_states.shape
+                indices = (slice(0, 2), slice(0, bsz), slice(0, self.num_heads), slice(0, seq_len+tgt_len), slice(0, self.hidden_dim_per_head))
+                past_key_value = self.past_key_values_pin_mem[idx][indices]
+                # print(f'773, hidden_states.shape = {hidden_states.shape}, seq_len = {seq_len}, tgt_len = {tgt_len}, past_key_value.shape = {past_key_value.shape}, device = {past_key_value.device}')
+            else:
+                past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
 
@@ -765,6 +798,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     kv_offload=kv_offload,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    is_decoding_stage=is_decoding_stage,
                 )
 
             hidden_states = layer_outputs[0]
@@ -788,10 +822,10 @@ class OPTDecoder(OPTPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        print(f'next_cache[0][0].shape: {next_cache[0][0].shape if next_cache else None}, device = {next_cache[0][0].device if next_cache else None}')
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -835,14 +869,10 @@ class OPTModel(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        kv_offload: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
-        print(f'{self.__class__}fwd, kv_offload = {kv_offload}')
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -994,8 +1024,10 @@ class OPTForCausalLM(OPTPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
         ```"""
-        kv_offload = kv_offload if kv_offload is not None else self.config.kv_offload
-        print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
+        if not kv_offload:
+            if hasattr(self.config, 'kv_offload'):
+                kv_offload = self.config.kv_offload
+        # print(f'entering {self.__class__}, input_ids.shape = {input_ids.shape}, {past_key_values[0][0].shape if past_key_values else None} ')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1016,7 +1048,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
         logits = self.lm_head(outputs[0]).contiguous()
 
         loss = None
@@ -1043,7 +1074,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        if past_key_values:
+        if past_key_values is not None:
             input_ids = input_ids[:, -1:]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step

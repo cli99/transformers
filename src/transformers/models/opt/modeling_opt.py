@@ -196,8 +196,7 @@ class OPTAttention(nn.Module):
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, hidden_dim = hidden_states.size()
-        if see_mem and is_decoding_stage:
-            print(f'in {self.__class__}, tgt_len = {tgt_len}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}')
+        # print(f'in {self.__class__}, tgt_len = {tgt_len}, hidden_dim = {hidden_dim}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}')
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
@@ -216,13 +215,12 @@ class OPTAttention(nn.Module):
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             if kv_offload:
                 seq_len = past_key_value.shape[3]
-                dst_indices = (slice(0, bsz), slice(seq_len-tgt_len, seq_len), slice(0, hidden_dim))
-                src_indices = (slice(0, bsz), slice(0, tgt_len), slice(0, hidden_dim))
+                _, h, _, hh  = key_states.shape
+                dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
+                src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
                 past_key_value[0][dst_indices].copy_(key_states[src_indices])
                 past_key_value[1][dst_indices].copy_(value_states[src_indices])
-                # new_indices = (slice(0, bsz), slice(0, seq_len+tgt_len), slice(0, hidden_dim))
                 key_states, value_states = past_key_value[0], past_key_value[1]
-                # print(f'decode stage, past_key_value.shape = {past_key_value.shape}, seq_len = {seq_len}, tgt_len = {tgt_len}, key_states.shape = {key_states.shape}, key_states.device = {key_states.device}')
             else:
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
@@ -230,7 +228,6 @@ class OPTAttention(nn.Module):
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-            # print(f'prompt stage, past_key_value.shape = {past_key_value.shape}, key_states.shape = {key_states.shape}, key_states.device = {key_states.device}')
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -280,10 +277,10 @@ class OPTAttention(nn.Module):
 
         #TODO: CHECK
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        # if attn_weights.dtype == torch.float16:
-        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
-        # else:
-        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        if attn_weights.dtype == torch.float16:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+        else:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -769,7 +766,6 @@ class OPTDecoder(OPTPreTrainedModel):
                 bsz, tgt_len, hidden_dim = hidden_states.shape
                 indices = (slice(0, 2), slice(0, bsz), slice(0, self.num_heads), slice(0, seq_len+tgt_len), slice(0, self.hidden_dim_per_head))
                 past_key_value = self.past_key_values_pin_mem[idx][indices]
-                # print(f'773, hidden_states.shape = {hidden_states.shape}, seq_len = {seq_len}, tgt_len = {tgt_len}, past_key_value.shape = {past_key_value.shape}, device = {past_key_value.device}')
             else:
                 past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -1027,7 +1023,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
         if not kv_offload:
             if hasattr(self.config, 'kv_offload'):
                 kv_offload = self.config.kv_offload
-        # print(f'entering {self.__class__}, input_ids.shape = {input_ids.shape}, {past_key_values[0][0].shape if past_key_values else None} ')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

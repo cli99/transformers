@@ -218,8 +218,10 @@ class OPTAttention(nn.Module):
                 _, h, _, hh  = key_states.shape
                 dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
                 src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
-                past_key_value[0][dst_indices].copy_(key_states[src_indices])
-                past_key_value[1][dst_indices].copy_(value_states[src_indices])
+                past_key_value[0][dst_indices].copy_(key_states[src_indices], non_blocking=False)
+                past_key_value[1][dst_indices].copy_(value_states[src_indices], non_blocking=False)
+                # print(f'dst_indices = {dst_indices}, src_indices = {src_indices}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}, past_key_value[1].device = {past_key_value[1].device}, past_key_value[1].shape = {past_key_value[1].shape}')
+
                 key_states, value_states = past_key_value[0], past_key_value[1]
             else:
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -240,8 +242,8 @@ class OPTAttention(nn.Module):
             if (not is_decoding_stage) and kv_offload:
                 b, s, h, hh  = key_states.shape
                 dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
-                past_key_value[0][dst_indices].copy_(key_states)
-                past_key_value[1][dst_indices].copy_(value_states)
+                past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
+                past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
                 past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
             else:
                 past_key_value = (key_states, value_states)
@@ -275,7 +277,6 @@ class OPTAttention(nn.Module):
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        #TODO: CHECK
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         if attn_weights.dtype == torch.float16:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -583,8 +584,18 @@ class OPTDecoder(OPTPreTrainedModel):
 
         self.past_key_values_pin_mem = None
         self.max_new_tokens = 32
+        self.max_prompt_len = 512
+        self.max_batch_size = 88
         self.num_heads = config.num_attention_heads
         self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
+        if config.kv_offload or True:
+            max_len = self.max_prompt_len + self.max_new_tokens - 1
+            assert hasattr(self, 'max_prompt_len'), 'max_prompt_len not set when kv_offload is True'
+            assert hasattr(self, 'max_batch_size'), 'max_batch_size not set when kv_offload is True'
+            assert hasattr(self, 'max_new_tokens'), 'max_new_tokens not set when kv_offload is True'
+            pin_buffer_shape = [len(self.layers), 2, self.max_batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
+            print(f'allocating {pin_buffer_shape} pinned cpu memory')
+            self.past_key_values_pin_mem = torch.empty(pin_buffer_shape, device='cpu', pin_memory=True)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -730,17 +741,6 @@ class OPTDecoder(OPTPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-        if kv_offload:
-            if not is_decoding_stage:
-                batch_size, prompt_len, hidden_dim = hidden_states.shape
-                max_len = prompt_len + self.max_new_tokens - 1
-                assert hasattr(self, 'max_new_tokens'), 'max_new_tokens not set when kv_offload is True'
-                pin_buffer_shape = [len(self.layers), 2, batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
-                if self.past_key_values_pin_mem is not None:
-                    del self.past_key_values_pin_mem
-                self.past_key_values_pin_mem = torch.empty(pin_buffer_shape).pin_memory()
-            else:
-                batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # check if head_mask has a correct number of layers specified if desired
         for attn_mask, mask_name in zip([head_mask], ["head_mask"]):

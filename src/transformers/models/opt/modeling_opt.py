@@ -214,15 +214,15 @@ class OPTAttention(nn.Module):
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             if kv_offload:
-                seq_len = past_key_value.shape[3]
-                _, h, _, hh  = key_states.shape
-                dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
-                src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
-                past_key_value[0][dst_indices].copy_(key_states[src_indices], non_blocking=False)
-                past_key_value[1][dst_indices].copy_(value_states[src_indices], non_blocking=False)
-                # print(f'dst_indices = {dst_indices}, src_indices = {src_indices}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}, past_key_value[1].device = {past_key_value[1].device}, past_key_value[1].shape = {past_key_value[1].shape}')
-
-                key_states, value_states = past_key_value[0], past_key_value[1]
+                print('-'* 30)
+                with TimedSync('attn decoding kv offload to cpu'):
+                    seq_len = past_key_value.shape[3]
+                    _, h, _, hh  = key_states.shape
+                    dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
+                    src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
+                    past_key_value[0][dst_indices].copy_(key_states[src_indices])
+                    past_key_value[1][dst_indices].copy_(value_states[src_indices])
+                    key_states, value_states = past_key_value[0], past_key_value[1]
             else:
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
@@ -240,11 +240,12 @@ class OPTAttention(nn.Module):
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             if (not is_decoding_stage) and kv_offload:
-                b, s, h, hh  = key_states.shape
-                dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
-                past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
-                past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
-                past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+                with TimedSync('attn prefill kv offload to cpu'):
+                    b, s, h, hh  = key_states.shape
+                    dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                    past_key_value[0][dst_indices].copy_(key_states)
+                    past_key_value[1][dst_indices].copy_(value_states)
+                    past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
             else:
                 past_key_value = (key_states, value_states)
 
@@ -254,61 +255,67 @@ class OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         if is_decoding_stage and kv_offload:
-            query_states = query_states.to('cpu')
+            with TimedSync('attn decoding query_states offload to cpu'):
+                query_states = query_states.to('cpu')
 
         # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
-        src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states.float(), key_states.transpose(1, 2).float())
+        with TimedSync('attn compute qk bmm on cpu'):
+            src_len = key_states.size(1)
+            attn_weights = torch.bmm(query_states.float(), key_states.transpose(1, 2).float())
 
-        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+        with TimedSync('attn compute softmax on cpu'):
+            if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
-            if is_decoding_stage and kv_offload:
-                attention_mask = attention_mask.to('cpu')
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if attn_weights.dtype == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    )
+                if is_decoding_stage and kv_offload:
+                    attention_mask = attention_mask.to('cpu')
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+                attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError(
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
-                )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+            # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
+            if attn_weights.dtype == torch.float16:
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+            else:
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-        if output_attentions:
-            # this operation is a bit awkward, but it's required to
-            # make sure that attn_weights keeps its gradient.
-            # In order to do so, attn_weights have to be reshaped
-            # twice and have to be reused in the following
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
-        else:
-            attn_weights_reshaped = None
+            if layer_head_mask is not None:
+                if layer_head_mask.size() != (self.num_heads,):
+                    raise ValueError(
+                        f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                        f" {layer_head_mask.size()}"
+                    )
+                attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+            if output_attentions:
+                # this operation is a bit awkward, but it's required to
+                # make sure that attn_weights keeps its gradient.
+                # In order to do so, attn_weights have to be reshaped
+                # twice and have to be reused in the following
+                attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+            else:
+                attn_weights_reshaped = None
 
-        attn_output = torch.bmm(attn_probs, value_states.float()).to(hidden_states.dtype)
+            attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+
+        with TimedSync('attn compute attn_output bmm on cpu'):
+            attn_output = torch.bmm(attn_probs, value_states.float()).to(hidden_states.dtype)
 
         # EVERYTHING ABOVE HAPPENS ON CPU when kv_offload is True in decoding stage
         if kv_offload:
-            attn_output = attn_output.to(hidden_states.device)
+            with TimedSync('attn attn_output copy back to gpu'):
+                attn_output = attn_output.to(hidden_states.device)
+            print('-'* 30)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(

@@ -259,9 +259,12 @@ class OPTAttention(nn.Module):
                 query_states = query_states.to('cpu')
 
         # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
-        with TimedSync('attn compute on cpu'):
+        with TimedSync('attn compute qk bmm on cpu'):
             src_len = key_states.size(1)
+            # print(f'query_states.shape = {query_states.shape}, key_states.shape = {key_states.shape}, query_states.device = {query_states.device}, key_states.device = {key_states.device}, query_states.dtype = {query_states.dtype}, key_states.dtype = {key_states.dtype}, query_states.is_pinned = {query_states.is_pinned()}, key_states.is_pinned = {key_states.is_pinned()}')
             attn_weights = torch.bmm(query_states.float(), key_states.transpose(1, 2).float())
+
+        with TimedSync('attn compute softmax on cpu'):
 
             if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
@@ -308,6 +311,7 @@ class OPTAttention(nn.Module):
 
             attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
+        with TimedSync('attn compute attn_output bmm on cpu'):
             attn_output = torch.bmm(attn_probs, value_states.float()).to(hidden_states.dtype)
 
         # EVERYTHING ABOVE HAPPENS ON CPU when kv_offload is True in decoding stage

@@ -48,15 +48,17 @@ class TimedSync:
 
     def __init__(self, f):
         self.f = f
-        self.cuda_start = torch.cuda.Event(enable_timing=True)
-        self.cuda_end = torch.cuda.Event(enable_timing=True)
+        # self.cuda_start = torch.cuda.Event(enable_timing=True)
+        # self.cuda_end = torch.cuda.Event(enable_timing=True)
 
     def __enter__(self):
+        return
         self.start = time.time()
         self.cuda_start.record()
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any):
+        return
         self.end = time.time()
         self.cuda_end.record()
         self.cuda_end.synchronize()
@@ -214,7 +216,7 @@ class OPTAttention(nn.Module):
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             if kv_offload:
-                print('-'* 30)
+                # print('-'* 30)
                 with TimedSync('attn decoding kv offload to cpu'):
                     seq_len = past_key_value.shape[3]
                     _, h, _, hh  = key_states.shape
@@ -318,7 +320,7 @@ class OPTAttention(nn.Module):
         if kv_offload:
             with TimedSync('attn attn_output copy back to gpu'):
                 attn_output = attn_output.to(hidden_states.device)
-            print('-'* 30)
+            # print('-'* 30)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(

@@ -202,7 +202,6 @@ class OPTAttention(nn.Module):
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, hidden_dim = hidden_states.size()
-        # print(f'in {self.__class__}, tgt_len = {tgt_len}, hidden_dim = {hidden_dim}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}')
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
@@ -220,16 +219,14 @@ class OPTAttention(nn.Module):
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             if kv_offload:
-                # print('-'* 30)
-                with TimedSync('attn decoding kv offload to cpu'):
-                    with torch.cuda.stream(self.store_cache_stream):
-                        seq_len = past_key_value.shape[3]
-                        _, h, _, hh  = key_states.shape
-                        dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
-                        src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
-                        past_key_value[0][dst_indices].copy_(key_states[src_indices], non_blocking=True)
-                        past_key_value[1][dst_indices].copy_(value_states[src_indices], non_blocking=True)
-                        key_states, value_states = past_key_value[0], past_key_value[1]
+                with TimedSync(f"{'-'* 30}\nattn decoding kv offload to cpu"):
+                    seq_len = past_key_value.shape[3]
+                    _, h, _, hh  = key_states.shape
+                    dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
+                    src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
+                    past_key_value[0][dst_indices].copy_(key_states[src_indices], non_blocking=True)
+                    past_key_value[1][dst_indices].copy_(value_states[src_indices], non_blocking=True)
+                    key_states, value_states = past_key_value[0], past_key_value[1]
             else:
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
@@ -246,14 +243,15 @@ class OPTAttention(nn.Module):
             # all previous decoder key/value_states. Further calls to uni-directional self-attention
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
-            if (not is_decoding_stage) and kv_offload:
+            if kv_offload and (not is_decoding_stage):
+                self.store_cache_stream.wait_stream(torch.cuda.current_stream())
                 with TimedSync('attn prefill kv offload to cpu'):
-                    # with torch.cuda.stream(self.store_cache_stream):
-                    b, s, h, hh  = key_states.shape
-                    dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
-                    past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
-                    past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
-                    past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+                    with torch.cuda.stream(self.store_cache_stream):
+                        b, s, h, hh  = key_states.shape
+                        dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                        past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
+                        past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
+                        past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
 
             else:
                 past_key_value = (key_states, value_states)
@@ -265,15 +263,11 @@ class OPTAttention(nn.Module):
 
         if is_decoding_stage and kv_offload:
             with TimedSync('attn decoding query_states offload to cpu'):
-                # with torch.cuda.stream(self.load_cache_stream):
-                query_states = query_states.float().cpu()
-                    # key_states = key_states.float()
-                    # value_states = value_states.float()
+                query_states = query_states.float().to('cpu')
 
         # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
         with TimedSync('attn compute qk bmm on cpu'):
             src_len = key_states.size(1)
-            # print(f'query_states.shape = {query_states.shape}, key_states.shape = {key_states.shape}, query_states.device = {query_states.device}, key_states.device = {key_states.device}, query_states.dtype = {query_states.dtype}, key_states.dtype = {key_states.dtype}, query_states.float().is_pinned = {query_states.is_pinned()}, key_states.transpose(1, 2).is_pinned = {key_states.transpose(1, 2).is_pinned()}')
             attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         with TimedSync('attn compute softmax on cpu'):
@@ -328,7 +322,6 @@ class OPTAttention(nn.Module):
         if kv_offload:
             with TimedSync('attn attn_output copy back to gpu'):
                 attn_output = attn_output.to(hidden_states.device)
-            # print('-'* 30)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -344,6 +337,8 @@ class OPTAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
 
         attn_output = self.out_proj(attn_output)
+
+        torch.cuda.current_stream().wait_stream(self.store_cache_stream)
 
         return attn_output, attn_weights_reshaped, past_key_value
 
@@ -599,6 +594,7 @@ class OPTDecoder(OPTPreTrainedModel):
             self.final_layer_norm = None
 
         self.load_cache_stream = torch.cuda.Stream()
+        # self.store_cache_stream = torch.cuda.current_stream()
         self.store_cache_stream = torch.cuda.Stream()
 
         self.layers = nn.ModuleList([OPTDecoderLayer(config, self.load_cache_stream, self.store_cache_stream) for _ in range(config.num_hidden_layers)])
@@ -614,6 +610,7 @@ class OPTDecoder(OPTPreTrainedModel):
         self.num_heads = config.num_attention_heads
         self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
 
+        # TODO: past_key_values_pin_mem cannot be directly allocated as float32 here, moved this to user code
         # if config.kv_offload or True:
         #     assert hasattr(self, 'max_prompt_len'), 'max_prompt_len not set when kv_offload is True'
         #     assert hasattr(self, 'max_batch_size'), 'max_batch_size not set when kv_offload is True'
@@ -621,7 +618,6 @@ class OPTDecoder(OPTPreTrainedModel):
         #     pin_buffer_shape = [len(self.layers), 2, self.max_batch_size, self.num_heads, self.max_prompt_len + self.max_new_tokens - 1, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
         #     torch.set_default_tensor_type(torch.FloatTensor)
         #     self.past_key_values_pin_mem = torch.empty(pin_buffer_shape, dtype=torch.float32, device='cpu', pin_memory=True)
-        #     print(f'allocating {pin_buffer_shape} pinned {self.past_key_values_pin_mem.dtype}')
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -658,7 +654,7 @@ class OPTDecoder(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        kv_offload: Optional[bool] = None,
+        kv_offload: Optional[bool] = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -710,12 +706,8 @@ class OPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        if not kv_offload:
-            if hasattr(self.config, 'kv_offload'):
-                kv_offload = self.config.kv_offload
         is_decoding_stage = past_key_values is not None
         if see_mem:
-            print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
             print(f'is_decoding_stage = {is_decoding_stage}')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -910,7 +902,6 @@ class OPTModel(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            kv_offload=kv_offload,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

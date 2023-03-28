@@ -48,17 +48,17 @@ class TimedSync:
 
     def __init__(self, f):
         self.f = f
-        self.cuda_start = torch.cuda.Event(enable_timing=True)
-        self.cuda_end = torch.cuda.Event(enable_timing=True)
+        # self.cuda_start = torch.cuda.Event(enable_timing=True)
+        # self.cuda_end = torch.cuda.Event(enable_timing=True)
 
     def __enter__(self):
-        # return
+        return
         self.start = time.time()
         self.cuda_start.record()
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any):
-        # return
+        return
         self.end = time.time()
         self.cuda_end.record()
         self.cuda_end.synchronize()
@@ -227,8 +227,8 @@ class OPTAttention(nn.Module):
                         _, h, _, hh  = key_states.shape
                         dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
                         src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
-                        past_key_value[0][dst_indices].copy_(key_states[src_indices])
-                        past_key_value[1][dst_indices].copy_(value_states[src_indices])
+                        past_key_value[0][dst_indices].copy_(key_states[src_indices], non_blocking=True)
+                        past_key_value[1][dst_indices].copy_(value_states[src_indices], non_blocking=True)
                         key_states, value_states = past_key_value[0], past_key_value[1]
             else:
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -248,12 +248,13 @@ class OPTAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             if (not is_decoding_stage) and kv_offload:
                 with TimedSync('attn prefill kv offload to cpu'):
-                    with torch.cuda.stream(self.store_cache_stream):
-                        b, s, h, hh  = key_states.shape
-                        dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
-                        past_key_value[0][dst_indices].copy_(key_states)
-                        past_key_value[1][dst_indices].copy_(value_states)
-                        past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+                    # with torch.cuda.stream(self.store_cache_stream):
+                    b, s, h, hh  = key_states.shape
+                    dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                    past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
+                    past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
+                    past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+
             else:
                 past_key_value = (key_states, value_states)
 
@@ -264,10 +265,10 @@ class OPTAttention(nn.Module):
 
         if is_decoding_stage and kv_offload:
             with TimedSync('attn decoding query_states offload to cpu'):
-                with torch.cuda.stream(self.load_cache_stream):
-                    query_states = query_states.float().cpu()
-                    key_states = key_states.float()
-                    value_states = value_states.float()
+                # with torch.cuda.stream(self.load_cache_stream):
+                query_states = query_states.float().cpu()
+                    # key_states = key_states.float()
+                    # value_states = value_states.float()
 
         # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
         with TimedSync('attn compute qk bmm on cpu'):
@@ -613,14 +614,14 @@ class OPTDecoder(OPTPreTrainedModel):
         self.num_heads = config.num_attention_heads
         self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
 
-        if config.kv_offload or True:
-            max_len = self.max_prompt_len + self.max_new_tokens - 1
-            assert hasattr(self, 'max_prompt_len'), 'max_prompt_len not set when kv_offload is True'
-            assert hasattr(self, 'max_batch_size'), 'max_batch_size not set when kv_offload is True'
-            assert hasattr(self, 'max_new_tokens'), 'max_new_tokens not set when kv_offload is True'
-            pin_buffer_shape = [len(self.layers), 2, self.max_batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
-            print(f'allocating {pin_buffer_shape} pinned cpu memory')
-            self.past_key_values_pin_mem = torch.empty(pin_buffer_shape, device='cpu', pin_memory=True)
+        # if config.kv_offload or True:
+        #     assert hasattr(self, 'max_prompt_len'), 'max_prompt_len not set when kv_offload is True'
+        #     assert hasattr(self, 'max_batch_size'), 'max_batch_size not set when kv_offload is True'
+        #     assert hasattr(self, 'max_new_tokens'), 'max_new_tokens not set when kv_offload is True'
+        #     pin_buffer_shape = [len(self.layers), 2, self.max_batch_size, self.num_heads, self.max_prompt_len + self.max_new_tokens - 1, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
+        #     torch.set_default_tensor_type(torch.FloatTensor)
+        #     self.past_key_values_pin_mem = torch.empty(pin_buffer_shape, dtype=torch.float32, device='cpu', pin_memory=True)
+        #     print(f'allocating {pin_buffer_shape} pinned {self.past_key_values_pin_mem.dtype}')
 
     def get_input_embeddings(self):
         return self.embed_tokens

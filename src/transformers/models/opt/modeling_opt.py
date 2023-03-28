@@ -198,7 +198,6 @@ class OPTAttention(nn.Module):
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, hidden_dim = hidden_states.size()
-        # print(f'in {self.__class__}, tgt_len = {tgt_len}, hidden_dim = {hidden_dim}, past_key_value[0].device = {past_key_value[0].device}, past_key_value[0].shape = {past_key_value[0].shape}')
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
@@ -216,7 +215,6 @@ class OPTAttention(nn.Module):
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             if kv_offload:
-                # print('-'* 30)
                 with TimedSync('attn decoding kv offload to cpu'):
                     seq_len = past_key_value.shape[3]
                     _, h, _, hh  = key_states.shape
@@ -263,7 +261,6 @@ class OPTAttention(nn.Module):
         # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
         with TimedSync('attn compute qk bmm on cpu'):
             src_len = key_states.size(1)
-            # print(f'query_states.shape = {query_states.shape}, key_states.shape = {key_states.shape}, query_states.device = {query_states.device}, key_states.device = {key_states.device}, query_states.dtype = {query_states.dtype}, key_states.dtype = {key_states.dtype}, query_states.is_pinned = {query_states.is_pinned()}, key_states.is_pinned = {key_states.is_pinned()}')
             attn_weights = torch.bmm(query_states.float(), key_states.transpose(1, 2).float())
 
         with TimedSync('attn compute softmax on cpu'):
@@ -685,12 +682,8 @@ class OPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        if not kv_offload:
-            if hasattr(self.config, 'kv_offload'):
-                kv_offload = self.config.kv_offload
         is_decoding_stage = past_key_values is not None
         if see_mem:
-            print(f'{self.__class__} fwd, kv_offload = {kv_offload}')
             print(f'is_decoding_stage = {is_decoding_stage}')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -742,8 +735,7 @@ class OPTDecoder(OPTPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-        if kv_offload:
-            if not is_decoding_stage:
+        if kv_offload and not is_decoding_stage:
                 batch_size, prompt_len, hidden_dim = hidden_states.shape
                 max_len = prompt_len + self.max_new_tokens - 1
                 assert hasattr(self, 'max_new_tokens'), 'max_new_tokens not set when kv_offload is True'
@@ -894,7 +886,6 @@ class OPTModel(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            kv_offload=kv_offload,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

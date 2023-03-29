@@ -158,6 +158,7 @@ class OPTAttention(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        store_cache_stream: torch.cuda.Stream = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -177,6 +178,8 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        self.store_cache_stream = store_cache_stream
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -239,29 +242,32 @@ class OPTAttention(nn.Module):
             # all previous decoder key/value_states. Further calls to uni-directional self-attention
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
-            if (not is_decoding_stage) and kv_offload:
+            if kv_offload and (not is_decoding_stage):
+                self.store_cache_stream.wait_stream(torch.cuda.current_stream())
                 with TimedSync('attn prefill kv offload to cpu'):
-                    b, s, h, hh  = key_states.shape
-                    dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
-                    past_key_value[0][dst_indices].copy_(key_states)
-                    past_key_value[1][dst_indices].copy_(value_states)
-                    past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+                    with torch.cuda.stream(self.store_cache_stream):
+                        b, s, h, hh  = key_states.shape
+                        dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                        past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
+                        past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
+                        past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
             else:
                 past_key_value = (key_states, value_states)
+
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
-        if is_decoding_stage and kv_offload:
+        if kv_offload and is_decoding_stage:
             with TimedSync('attn decoding query_states offload to cpu'):
-                query_states = query_states.to('cpu')
+                query_states = query_states.float().to('cpu')
 
         # EVERYTHING BELOW HAPPENS ON CPU when kv_offload is True in decoding stage
         with TimedSync('attn compute qk bmm on cpu'):
             src_len = key_states.size(1)
-            attn_weights = torch.bmm(query_states.float(), key_states.transpose(1, 2).float())
+            attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         with TimedSync('attn compute softmax on cpu'):
 
@@ -282,7 +288,6 @@ class OPTAttention(nn.Module):
                 attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
                 attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-            #TODO: CHECK
             # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
             if attn_weights.dtype == torch.float16:
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -311,7 +316,7 @@ class OPTAttention(nn.Module):
             attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
         with TimedSync('attn compute attn_output bmm on cpu'):
-            attn_output = torch.bmm(attn_probs, value_states.float()).to(hidden_states.dtype)
+            attn_output = torch.bmm(attn_probs, value_states).to(hidden_states.dtype)
 
         # EVERYTHING ABOVE HAPPENS ON CPU when kv_offload is True in decoding stage
         if kv_offload:
@@ -333,11 +338,14 @@ class OPTAttention(nn.Module):
 
         attn_output = self.out_proj(attn_output)
 
+        if kv_offload:
+            torch.cuda.current_stream().wait_stream(self.store_cache_stream)
+
         return attn_output, attn_weights_reshaped, past_key_value
 
 
 class OPTDecoderLayer(nn.Module):
-    def __init__(self, config: OPTConfig):
+    def __init__(self, config: OPTConfig, store_cache_stream: torch.cuda.Stream = None):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = OPTAttention(
@@ -346,6 +354,7 @@ class OPTDecoderLayer(nn.Module):
             dropout=config.attention_dropout,
             is_decoder=True,
             bias=config.enable_bias,
+            store_cache_stream=store_cache_stream,
         )
         self.do_layer_norm_before = config.do_layer_norm_before
         self.dropout = config.dropout
@@ -584,7 +593,8 @@ class OPTDecoder(OPTPreTrainedModel):
         else:
             self.final_layer_norm = None
 
-        self.layers = nn.ModuleList([OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.store_cache_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.layers = nn.ModuleList([OPTDecoderLayer(config, self.store_cache_stream) for _ in range(config.num_hidden_layers)])
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing

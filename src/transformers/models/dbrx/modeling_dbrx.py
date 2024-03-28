@@ -1327,7 +1327,6 @@ class DbrxForCausalLM(DbrxPreTrainedModel):
         self.split_expert_weights = config.ffn_config.split_expert_weights
 
         def _load_state_dict_pre_hook(state_dict, *args, **kwargs):
-            """Redefine module saved as DbrxExpertGLU."""
             new_state_dict = type(state_dict)()
             ws = ["w1", "v1", "w2"]
             n_layers = self.config.n_layers
@@ -1339,7 +1338,6 @@ class DbrxForCausalLM(DbrxPreTrainedModel):
                     for w in ws:
                         target_k = ".".join(["transformer.blocks", str(idx), "ffn.experts.mlp", w])
                         if k == target_k:
-                            print(f"Loading {target_k} from state_dict, {v.shape=}")
                             ws_reshaped =v.view(moe_num_experts, ffn_hidden_size,
                                                             hidden_size)
                             if w == "w2":

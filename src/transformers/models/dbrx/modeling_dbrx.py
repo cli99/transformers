@@ -796,13 +796,20 @@ class DbrxExpertGLU(nn.Module):
 class DbrxExperts(nn.Module):
 
     def __init__(self, hidden_size: int, ffn_hidden_size: int,
-                 moe_num_experts: int, ffn_act_fn: dict):
+                 moe_num_experts: int, ffn_act_fn: dict, split_expert_weights: bool):
         super().__init__()
         self.moe_num_experts = moe_num_experts
-        self.mlp = DbrxExpertGLU(hidden_size=hidden_size,
-                                 ffn_hidden_size=ffn_hidden_size,
-                                 moe_num_experts=moe_num_experts,
-                                 ffn_act_fn=ffn_act_fn)
+        if split_expert_weights:
+            self.mlp = DbrxExpertGLUSplit(hidden_size=hidden_size,
+                                    ffn_hidden_size=ffn_hidden_size,
+                                    moe_num_experts=moe_num_experts,
+                                    ffn_act_fn=ffn_act_fn)
+
+        else:
+            self.mlp = DbrxExpertGLU(hidden_size=hidden_size,
+                                    ffn_hidden_size=ffn_hidden_size,
+                                    moe_num_experts=moe_num_experts,
+                                    ffn_act_fn=ffn_act_fn)
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor,
                 top_weights: torch.Tensor,
@@ -831,6 +838,42 @@ class DbrxExperts(nn.Module):
         out = out.reshape(bsz, q_len, hidden_size)
         return out
 
+class DbrxExpertGLUSplit(nn.Module):
+
+    def __init__(self, hidden_size: int, ffn_hidden_size: int, moe_num_experts: int, ffn_act_fn: dict):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.moe_num_experts = moe_num_experts
+
+        self.w1 = nn.ModuleList([nn.Linear(
+            in_features=hidden_size,
+            out_features=ffn_hidden_size,
+            bias=False,
+        ) for _ in range(self.moe_num_experts)])
+
+        self.v1 = nn.ModuleList([nn.Linear(
+            in_features=hidden_size,
+            out_features=ffn_hidden_size,
+            bias=False,
+        ) for _ in range(self.moe_num_experts)])
+
+
+        self.w2 = nn.ModuleList([nn.Linear(
+            in_features=ffn_hidden_size,
+            out_features=hidden_size,
+            bias=False,
+        ) for _ in range(self.moe_num_experts)])
+
+        self.activation_fn = resolve_ffn_act_fn(ffn_act_fn)
+
+    def forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        x1 = self.w1[expert_idx](x)
+        x2 = self.v1[expert_idx](x)
+        x1 = self.activation_fn(x1)
+        x1 = x1 * x2
+        x1 = self.w2[expert_idx](x1)
+        return x1
 
 class DbrxFFN(nn.Module):
 
@@ -852,6 +895,7 @@ class DbrxFFN(nn.Module):
             ffn_hidden_size=ffn_config.ffn_hidden_size,
             moe_num_experts=ffn_config.moe_num_experts,
             ffn_act_fn=ffn_config.ffn_act_fn,
+            split_expert_weights=ffn_config.split_expert_weights,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1280,6 +1324,34 @@ class DbrxForCausalLM(DbrxPreTrainedModel):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.ffn_config.moe_num_experts
         self.num_experts_per_tok = config.ffn_config.moe_top_k
+        self.split_expert_weights = config.ffn_config.split_expert_weights
+
+        def _load_state_dict_pre_hook(state_dict, *args, **kwargs):
+            """Redefine module saved as DbrxExpertGLU."""
+            new_state_dict = type(state_dict)()
+            ws = ["w1", "v1", "w2"]
+            n_layers = self.config.n_layers
+            moe_num_experts = self.config.ffn_config.moe_num_experts
+            ffn_hidden_size = self.config.ffn_config.ffn_hidden_size
+            hidden_size = self.config.d_model
+            for k, v in state_dict.items():
+                for idx in range(n_layers):
+                    for w in ws:
+                        target_k = ".".join(["transformer.blocks", str(idx), "ffn.experts.mlp", w])
+                        if k == target_k:
+                            print(f"Loading {target_k} from state_dict, {v.shape=}")
+                            ws_reshaped =v.view(moe_num_experts, ffn_hidden_size,
+                                                            hidden_size)
+                            if w == "w2":
+                                ws_reshaped = ws_reshaped.transpose(-1, -2)
+                            for idx in range(moe_num_experts):
+                                new_k = '.'.join([k, str(idx), 'weight'])
+                                new_state_dict[new_k] = ws_reshaped[idx]
+
+            state_dict.update(new_state_dict)
+
+        if config.ffn_config.split_expert_weights:
+            self._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
 
         # Initialize weights and apply final processing
         self.post_init()

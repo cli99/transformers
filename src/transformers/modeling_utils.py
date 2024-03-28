@@ -2956,11 +2956,11 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             else:
                 device_map = {"": device_map}
 
-        if device_map is not None:
-            if low_cpu_mem_usage is None:
-                low_cpu_mem_usage = True
-            elif not low_cpu_mem_usage:
-                raise ValueError("Passing along a `device_map` requires `low_cpu_mem_usage=True`")
+        # if device_map is not None:
+        #     if low_cpu_mem_usage is None:
+        #         low_cpu_mem_usage = True
+        #     elif not low_cpu_mem_usage:
+        #         raise ValueError("Passing along a `device_map` requires `low_cpu_mem_usage=True`")
 
         if low_cpu_mem_usage:
             if is_deepspeed_zero3_enabled():
@@ -3821,21 +3821,22 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                             output_embeddings._is_hf_initialized = True
             else:
                 not_initialized_submodules = dict(model.named_modules())
-            # This will only initialize submodules that are not marked as initialized by the line above.
-            if is_deepspeed_zero3_enabled() and not is_quantized:
-                import deepspeed
 
-                not_initialized_parameters = list(
-                    set(
-                        itertools.chain.from_iterable(
-                            submodule.parameters(recurse=False) for submodule in not_initialized_submodules.values()
-                        )
-                    )
-                )
-                with deepspeed.zero.GatheredParameters(not_initialized_parameters, modifier_rank=0):
-                    model.apply(model._initialize_weights)
-            else:
-                model.apply(model._initialize_weights)
+            # This will only initialize submodules that are not marked as initialized by the line above.
+            # if is_deepspeed_zero3_enabled():
+            #     import deepspeed
+
+            #     not_initialized_parameters = list(
+            #         set(
+            #             itertools.chain.from_iterable(
+            #                 submodule.parameters(recurse=False) for submodule in not_initialized_submodules.values()
+            #             )
+            #         )
+            #     )
+            #     with deepspeed.zero.GatheredParameters(not_initialized_parameters, modifier_rank=0):
+            #         model.apply(model._initialize_weights)
+            # else:
+            #     model.apply(model._initialize_weights)
 
         # Set some modules to fp32 if any
         if keep_in_fp32_modules is not None:

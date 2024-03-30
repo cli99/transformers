@@ -1348,8 +1348,48 @@ class DbrxForCausalLM(DbrxPreTrainedModel):
 
             state_dict.update(new_state_dict)
 
+        def _state_dict_hook(module, state_dict, prefix, local_metadata):
+            """Returns the state dict of the model."""
+            n_layers = self.config.n_layers
+            moe_num_experts = self.config.ffn_config.moe_num_experts
+            ffn_hidden_size = self.config.ffn_config.ffn_hidden_size
+            hidden_size = self.config.d_model
+
+            for idx in range(n_layers):
+                for w in ["w1", "v1", "w2"]:
+                    ws = []
+
+                    key =  f'transformer.blocks.{idx}.ffn.experts.mlp.{w}'
+
+                    new_key = f'transformer.blocks.{idx}.ffn.experts.mlp.{w}'
+                    if key.startswith('_fsdp_wrapped_module.'):
+                        new_key = '_fsdp_wrapped_module.' + new_key
+
+                    for expert_idx in range(moe_num_experts):
+                        inner_key = key + f'.{expert_idx}.weight'
+                        if inner_key not in state_dict:
+                            inner_key = '_fsdp_wrapped_module.' + inner_key
+
+                        if inner_key not in state_dict:
+                            continue
+
+                        ws.append(state_dict[inner_key])
+
+                    if len(ws) > 0 and isinstance(ws[0], torch.Tensor):
+                        ws = torch.stack(ws)
+                        ws = ws.view(moe_num_experts * ffn_hidden_size, hidden_size)
+                        state_dict[new_key] = ws
+
+                        # Remove old keys
+                        for expert_idx in range(moe_num_experts):
+                            inner_key = key + f'.{expert_idx}.weight'
+                            if inner_key not in state_dict:
+                                inner_key = '_fsdp_wrapped_module.' + inner_key
+                            del state_dict[inner_key]
+
         if config.ffn_config.split_expert_weights:
             self._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
+            self._register_state_dict_hook(_state_dict_hook)
 
         # Initialize weights and apply final processing
         self.post_init()

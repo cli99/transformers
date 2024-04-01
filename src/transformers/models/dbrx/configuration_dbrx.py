@@ -119,6 +119,7 @@ class DbrxFFNConfig(PretrainedConfig):
         moe_normalize_expert_weights: Optional[float] = 1,
         uniform_expert_assignment: bool = False,
         split_expert_weights: bool = False,
+        fuse_expert_weights_on_save: bool = False,
         **kwargs: Any,
     ):
         super().__init__()
@@ -133,6 +134,7 @@ class DbrxFFNConfig(PretrainedConfig):
         self.moe_normalize_expert_weights = moe_normalize_expert_weights
         self.uniform_expert_assignment = uniform_expert_assignment
         self.split_expert_weights = split_expert_weights
+        self.fuse_expert_weights_on_save = fuse_expert_weights_on_save
 
         for k in ['model_type']:
             if k in kwargs:

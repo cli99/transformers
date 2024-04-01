@@ -896,7 +896,6 @@ class DbrxFFN(nn.Module):
             moe_num_experts=ffn_config.moe_num_experts,
             ffn_act_fn=ffn_config.ffn_act_fn,
             split_expert_weights=ffn_config.split_expert_weights,
-            fuse_expert_weights_on_save=ffn_config.fuse_expert_weights_on_save,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

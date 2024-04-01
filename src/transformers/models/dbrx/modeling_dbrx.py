@@ -896,6 +896,7 @@ class DbrxFFN(nn.Module):
             moe_num_experts=ffn_config.moe_num_experts,
             ffn_act_fn=ffn_config.ffn_act_fn,
             split_expert_weights=ffn_config.split_expert_weights,
+            fuse_expert_weights_on_save=ffn_config.fuse_expert_weights_on_save,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1325,6 +1326,7 @@ class DbrxForCausalLM(DbrxPreTrainedModel):
         self.num_experts = config.ffn_config.moe_num_experts
         self.num_experts_per_tok = config.ffn_config.moe_top_k
         self.split_expert_weights = config.ffn_config.split_expert_weights
+        self.fuse_expert_weights_on_save = config.ffn_config.fuse_expert_weights_on_save
 
         def _load_state_dict_pre_hook(state_dict, *args, **kwargs):
             new_state_dict = type(state_dict)()
@@ -1383,6 +1385,8 @@ class DbrxForCausalLM(DbrxPreTrainedModel):
 
         if config.ffn_config.split_expert_weights:
             self._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
+
+        if config.ffn_config.fuse_expert_weights_on_save:
             self._register_state_dict_hook(_state_dict_hook)
 
         # Initialize weights and apply final processing
